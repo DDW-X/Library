@@ -1,0 +1,38 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=06/29/2025,3.0.0.0
+CatalogFile=OmniAccessDriver.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+OmniAccessDriver.sys = 1,,
+
+[DefaultInstall]
+CopyFiles = DriverCopyFiles
+
+[DriverCopyFiles]
+OmniAccessDriver.sys
+
+[DefaultInstall.Services]
+AddService = OmniAccessDriver,0x00000002,ServiceInstall
+
+[ServiceInstall]
+DisplayName    = %ServiceName%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\OmniAccessDriver.sys
+LoadOrderGroup = Base
+
+[Strings]
+Provider = "DDW-X"
+ServiceName = "OmniAccess Driver"
+DiskName = "OmniAccess Driver Installation Disk"

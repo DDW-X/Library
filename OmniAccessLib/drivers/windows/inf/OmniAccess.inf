@@ -1,0 +1,411 @@
+// OmniAccess.inf - Placeholder content
+*این فایل باینری است و به صورت کد متنی قابل نمایش نیست. پس از کامپایل با دستور زیر ایجاد می‌شود:*
+```batch
+cl /nologo /O2 /D_AMD64_ /D_WIN64 /D_WINDOWS /D_NDEBUG /kernel ^
+   /Iinclude /Isrc/windows ^
+   src/windows/driver.c src/windows/memory.c src/windows/io.c ^
+   /link /DRIVER /OUT:OmniAccess.sys
+```
+---
+
+#include <ntddk.h>
+#include <wdf.h>
+#include <ntstrsafe.h>
+
+#define DRIVER_DEVICE_NAME L"\\Device\\OmniAccessDriver"
+#define DRIVER_SYMBOLIC_LINK L"\\DosDevices\\OmniAccessDriver"
+#define MAX_PHYS_MEM_MAP 16
+
+typedef struct {
+    PVOID buffer;
+    SIZE_T size;
+    ULONGLONG address;
+    ULONG port_number;
+    UCHAR value;
+    UCHAR pci_bus;
+    UCHAR pci_device;
+    UCHAR pci_function;
+    UCHAR pci_register;
+    ULONG pci_value;
+    ULONG msr_register;
+    ULONGLONG msr_value;
+} KERNEL_REQUEST;
+
+typedef struct {
+    ULONGLONG physical_address;
+    SIZE_T size;
+    PVOID mapped_address;
+} PHYSICAL_MAPPING;
+
+static PHYSICAL_MAPPING active_mappings[MAX_PHYS_MEM_MAP];
+static int mapping_count = 0;
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT driver_obj, PUNICODE_STRING reg_path);
+NTSTATUS DispatchCreate(PDEVICE_OBJECT device_obj, PIRP irp);
+NTSTATUS DispatchClose(PDEVICE_OBJECT device_obj, PIRP irp);
+NTSTATUS DispatchIoctl(PDEVICE_OBJECT device_obj, PIRP irp);
+VOID DriverUnload(PDRIVER_OBJECT driver_obj);
+NTSTATUS HandleReadPhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandleWritePhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandleMapPhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandleUnmapPhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandlePortRead(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandlePortWrite(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandlePciRead(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandlePciWrite(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandleReadMsr(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandleWriteMsr(PIRP irp, PIO_STACK_LOCATION stack);
+NTSTATUS HandleExecKernelCode(PIRP irp, PIO_STACK_LOCATION stack);
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT driver_obj, PUNICODE_STRING reg_path) {
+    UNREFERENCED_PARAMETER(reg_path);
+    
+    UNICODE_STRING dev_name, sym_link;
+    PDEVICE_OBJECT dev_obj;
+    NTSTATUS status;
+    
+    RtlInitUnicodeString(&dev_name, DRIVER_DEVICE_NAME);
+    RtlInitUnicodeString(&sym_link, DRIVER_SYMBOLIC_LINK);
+    
+    status = IoCreateDevice(
+        driver_obj,
+        0,
+        &dev_name,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &dev_obj);
+    
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("Failed to create device (0x%08X)\n", status));
+        return status;
+    }
+    
+    status = IoCreateSymbolicLink(&sym_link, &dev_name);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("Failed to create symbolic link (0x%08X)\n", status));
+        IoDeleteDevice(dev_obj);
+        return status;
+    }
+    
+    driver_obj->MajorFunction[IRP_MJ_CREATE] = DispatchCreate;
+    driver_obj->MajorFunction[IRP_MJ_CLOSE] = DispatchClose;
+    driver_obj->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchIoctl;
+    driver_obj->DriverUnload = DriverUnload;
+    
+    KdPrint(("OmniAccess Driver loaded successfully\n"));
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DispatchCreate(PDEVICE_OBJECT device_obj, PIRP irp) {
+    UNREFERENCED_PARAMETER(device_obj);
+    
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DispatchClose(PDEVICE_OBJECT device_obj, PIRP irp) {
+    UNREFERENCED_PARAMETER(device_obj);
+    
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DispatchIoctl(PDEVICE_OBJECT device_obj, PIRP irp) {
+    UNREFERENCED_PARAMETER(device_obj);
+    
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    
+    switch (stack->Parameters.DeviceIoControl.IoControlCode) {
+        case 0x800: // IOCTL_READ_PHYS_MEM
+            status = HandleReadPhysicalMemory(irp, stack);
+            break;
+        case 0x801: // IOCTL_WRITE_PHYS_MEM
+            status = HandleWritePhysicalMemory(irp, stack);
+            break;
+        case 0x802: // IOCTL_MAP_PHYS_MEM
+            status = HandleMapPhysicalMemory(irp, stack);
+            break;
+        case 0x803: // IOCTL_UNMAP_PHYS_MEM
+            status = HandleUnmapPhysicalMemory(irp, stack);
+            break;
+        case 0x804: // IOCTL_PORT_READ
+            status = HandlePortRead(irp, stack);
+            break;
+        case 0x805: // IOCTL_PORT_WRITE
+            status = HandlePortWrite(irp, stack);
+            break;
+        case 0x806: // IOCTL_PCI_READ
+            status = HandlePciRead(irp, stack);
+            break;
+        case 0x807: // IOCTL_PCI_WRITE
+            status = HandlePciWrite(irp, stack);
+            break;
+        case 0x808: // IOCTL_READ_MSR
+            status = HandleReadMsr(irp, stack);
+            break;
+        case 0x809: // IOCTL_WRITE_MSR
+            status = HandleWriteMsr(irp, stack);
+            break;
+        case 0x80A: // IOCTL_EXEC_KERNEL_CODE
+            status = HandleExecKernelCode(irp, stack);
+            break;
+        default:
+            KdPrint(("Unsupported IOCTL: 0x%X\n", stack->Parameters.DeviceIoControl.IoControlCode));
+            break;
+    }
+    
+    if (status != STATUS_PENDING) {
+        irp->IoStatus.Status = status;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+    }
+    
+    return status;
+}
+
+VOID DriverUnload(PDRIVER_OBJECT driver_obj) {
+    UNICODE_STRING sym_link;
+    RtlInitUnicodeString(&sym_link, DRIVER_SYMBOLIC_LINK);
+    IoDeleteSymbolicLink(&sym_link);
+    
+    if (driver_obj->DeviceObject) {
+        IoDeleteDevice(driver_obj->DeviceObject);
+    }
+    
+    // Unmap all active mappings
+    for (int i = 0; i < mapping_count; i++) {
+        if (active_mappings[i].mapped_address) {
+            MmUnmapIoSpace(active_mappings[i].mapped_address, active_mappings[i].size);
+        }
+    }
+    mapping_count = 0;
+    
+    KdPrint(("OmniAccess Driver unloaded\n"));
+}
+
+NTSTATUS HandleReadPhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request || request->size > 4096) {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+    
+    PHYSICAL_ADDRESS phys_addr;
+    phys_addr.QuadPart = request->address;
+    
+    PVOID mapped_addr = MmMapIoSpace(phys_addr, request->size, MmNonCached);
+    if (!mapped_addr) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    RtlCopyMemory(request->buffer, mapped_addr, request->size);
+    MmUnmapIoSpace(mapped_addr, request->size);
+    
+    irp->IoStatus.Information = request->size;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandleWritePhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request || request->size > 4096) {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+    
+    PHYSICAL_ADDRESS phys_addr;
+    phys_addr.QuadPart = request->address;
+    
+    PVOID mapped_addr = MmMapIoSpace(phys_addr, request->size, MmNonCached);
+    if (!mapped_addr) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    RtlCopyMemory(mapped_addr, request->buffer, request->size);
+    MmUnmapIoSpace(mapped_addr, request->size);
+    
+    irp->IoStatus.Information = request->size;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandleMapPhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    PHYSICAL_ADDRESS phys_addr;
+    phys_addr.QuadPart = request->address;
+    
+    PVOID mapped_addr = MmMapIoSpace(phys_addr, request->size, MmNonCached);
+    if (!mapped_addr) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    // Store mapping information
+    if (mapping_count < MAX_PHYS_MEM_MAP) {
+        active_mappings[mapping_count].physical_address = request->address;
+        active_mappings[mapping_count].size = request->size;
+        active_mappings[mapping_count].mapped_address = mapped_addr;
+        mapping_count++;
+    }
+    
+    // Return mapped address to user mode
+    *(PVOID*)irp->AssociatedIrp.SystemBuffer = mapped_addr;
+    irp->IoStatus.Information = sizeof(PVOID);
+    
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandleUnmapPhysicalMemory(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request || !request->buffer) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    // Find and unmap
+    for (int i = 0; i < mapping_count; i++) {
+        if (active_mappings[i].mapped_address == request->buffer) {
+            MmUnmapIoSpace(request->buffer, active_mappings[i].size);
+            active_mappings[i] = active_mappings[mapping_count - 1];
+            mapping_count--;
+            return STATUS_SUCCESS;
+        }
+    }
+    
+    return STATUS_NOT_FOUND;
+}
+
+NTSTATUS HandlePortRead(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    switch (stack->Parameters.DeviceIoControl.OutputBufferLength) {
+        case 1:
+            request->value = READ_PORT_UCHAR((PUCHAR)request->port_number);
+            break;
+        case 2:
+            *((USHORT*)&request->value) = READ_PORT_USHORT((PUSHORT)request->port_number);
+            break;
+        case 4:
+            *((ULONG*)&request->value) = READ_PORT_ULONG((PULONG)request->port_number);
+            break;
+        default:
+            return STATUS_INVALID_BUFFER_SIZE;
+    }
+    
+    irp->IoStatus.Information = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandlePortWrite(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    switch (stack->Parameters.DeviceIoControl.InputBufferLength) {
+        case 1:
+            WRITE_PORT_UCHAR((PUCHAR)request->port_number, request->value);
+            break;
+        case 2:
+            WRITE_PORT_USHORT((PUSHORT)request->port_number, (USHORT)request->value);
+            break;
+        case 4:
+            WRITE_PORT_ULONG((PULONG)request->port_number, (ULONG)request->value);
+            break;
+        default:
+            return STATUS_INVALID_BUFFER_SIZE;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandlePciRead(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    ULONG pci_address = (request->pci_bus << 16) | 
+                        (request->pci_device << 11) | 
+                        (request->pci_function << 8) | 
+                        (request->pci_register & 0xFC);
+    
+    WRITE_PORT_ULONG((PULONG)0xCF8, pci_address | 0x80000000);
+    request->pci_value = READ_PORT_ULONG((PULONG)0xCFC);
+    
+    irp->IoStatus.Information = sizeof(KERNEL_REQUEST);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandlePciWrite(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    ULONG pci_address = (request->pci_bus << 16) | 
+                        (request->pci_device << 11) | 
+                        (request->pci_function << 8) | 
+                        (request->pci_register & 0xFC);
+    
+    WRITE_PORT_ULONG((PULONG)0xCF8, pci_address | 0x80000000);
+    WRITE_PORT_ULONG((PULONG)0xCFC, request->pci_value);
+    
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandleReadMsr(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    request->msr_value = __readmsr(request->msr_register);
+    
+    irp->IoStatus.Information = sizeof(KERNEL_REQUEST);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS HandleWriteMsr(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    __writemsr(request->msr_register, request->msr_value);
+    return STATUS_SUCCESS;
+}
+
+typedef NTSTATUS (*KERNEL_FUNC)(void);
+
+NTSTATUS HandleExecKernelCode(PIRP irp, PIO_STACK_LOCATION stack) {
+    KERNEL_REQUEST* request = (KERNEL_REQUEST*)irp->AssociatedIrp.SystemBuffer;
+    
+    if (!request || !request->buffer) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    
+    KERNEL_FUNC func = (KERNEL_FUNC)request->buffer;
+    NTSTATUS status = func();
+    
+    *(NTSTATUS*)irp->AssociatedIrp.SystemBuffer = status;
+    irp->IoStatus.Information = sizeof(NTSTATUS);
+    
+    return STATUS_SUCCESS;
+}

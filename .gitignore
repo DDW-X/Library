@@ -1,0 +1,29 @@
+
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.lib
+*.pdb
+*.sys
+*.ko
+
+# Build directories
+/build/
+/bin/
+/out/
+/dist/
+
+# IDE / OS files
+.vscode/
+.DS_Store
+
+# Logs and cache
+*.log
+*.tmp
+*.swp
+*.bak
+.ccache/
+coverage/
